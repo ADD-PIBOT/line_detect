@@ -4,26 +4,29 @@
 #include <opencv2/opencv.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/Image.h>
-#include <geometry_msgs/Pose2D.h>
-
 #include <vector>
+#include <geometry_msgs/Pose2D.h>
+#include "aviation_master/runway_alignment.h"
+
+#define ANGLE_ERROR_TUNING 1.8 // DEGREE
+#define LATERAL_ERROR_TUNING 0.001 // PIXEL
 
 using namespace std;
 using namespace cv;
 
-//Yellow ROI
-int roi_x = 1760;
-int roi_y = 0;
-int roi_width = 2500;
-int roi_height = 700;
+//White ROI
+int roi_x = 2250;
+int roi_y = 400;
+int roi_width = 1000;
+int roi_height = 350;
 
-//Yellow Color Setting
-int yellow_hue_low = 10;
+//White Color Setting
+int yellow_hue_low = 13;
 int yellow_hue_high = 30;
-int yellow_sat_low = 60;
-int yellow_sat_high = 255;
-int yellow_val_low = 50;
-int yellow_val_high =200;
+int yellow_sat_low = 55;
+int yellow_sat_high = 200;
+int yellow_val_low = 40;
+int yellow_val_high = 125;
 
 int main(int argc, char** argv)
 {
@@ -40,13 +43,14 @@ int main(int argc, char** argv)
     msg.theta = m (Radian degree of line)
   */
   geometry_msgs::Pose2D fitLine_msg;
-  ros::Publisher pub_fitLine = nh.advertise<geometry_msgs::Pose2D>("/yellow_detect/yellow_line_pos", 1000);
+  ros::Publisher pub_fitLine = nh.advertise<geometry_msgs::Pose2D>("/yellow_detect/yellow_line_pos", 10);
+  ros::Publisher pub_runway_align = nh.advertise<aviation_master::runway_alignment>("yellow_lane_runway_align", 10);
 
-  // Set Publishers & Sublscribers
+  // Set Publishers & Subscribers
   image_transport::ImageTransport it(nh);
   image_transport::Publisher pub = it.advertise("/yellow_detect/yellow_detect_img", 1);
   image_transport::Publisher pub2 = it.advertise("/yellow_detect/yellow_img", 1);
-  image_transport::Subscriber sub = it.subscribe("/mindvision1/image", 1,
+  image_transport::Subscriber sub = it.subscribe("/mindvision1/image_rect_color", 1,
   [&](const sensor_msgs::ImageConstPtr& msg){
     cv_bridge::CvImageConstPtr cv_ptr;
     try
@@ -58,9 +62,9 @@ int main(int argc, char** argv)
       ROS_ERROR("cv_bridge Error ! : %s", e.what());
       return;
     }
-
+                        
     // Recognize Slope angle tolerance
-    int slope_tor = 45;
+    int slope_tor = 75;
     // Recognize Slope angle treshold (-45 deg ~ 45deg)
     double slope_treshold = (90 - slope_tor) * CV_PI / 180.0;
 
@@ -83,14 +87,27 @@ int main(int argc, char** argv)
     cvtColor(frame, img_hsv, COLOR_BGR2HSV);
     inRange(img_hsv, Scalar(yellow_hue_low, yellow_sat_low, yellow_val_low) , Scalar(yellow_hue_high, yellow_sat_high, yellow_val_high), yellow_mask);
     bitwise_and(frame, frame, img_yellow, yellow_mask);
+    medianBlur(img_yellow, img_yellow, 5);
     img_yellow.copyTo(copyImg);
 
     // Canny Edge Detection
     cvtColor(img_yellow, img_yellow, COLOR_BGR2GRAY);
-    Canny(img_yellow, img_edge, 50, 450);
+    // Canny(img_yellow, img_edge, 30, 60);
+    // Sobel(img_yellow, img_edge, img_yellow.type(), 1, 0, 3);
+    // Scharr(img_yellow, img_edge, img_yellow.type(), 1, 0, 3);
+    Mat img_edgeXp;
+    Mat prewittP = (Mat_<int>(3,3) << -1, 0, 1, -2, 0, 2, -1, 0, 1);
+    filter2D(img_yellow, img_edgeXp, img_yellow.type(), prewittP);
+
+    Mat img_edgeXm;
+    Mat prewittM = (Mat_<int>(3,3) << 1, 0, -1, 2, 0, -2, 1, 0, -1);
+    filter2D(img_yellow, img_edgeXm, img_yellow.type(), prewittM);
+
+    img_edge = img_edgeXp + img_edgeXm;
+    // medianBlur(edges, img_edge, 9);
 
     // Line Dtection
-    HoughLinesP(img_edge, lines, 1, CV_PI / 180 , 50 ,20, 10);
+    HoughLinesP(img_edge, lines, 1, CV_PI / 180 , 50, 50, 25);
 
     //cout << "slope treshol : " << slope_treshold << endl;
 
@@ -125,23 +142,43 @@ int main(int argc, char** argv)
       double pt1_x = ((pt1_y - b.y) / m) + b.x;
       double pt2_x = ((pt2_y - b.y) / m) + b.x;
 
-      //cout << "slope : " << (static_cast<double>(pt1_y) - static_cast<double>(pt2_y)) / (static_cast<double>(pt1_x) - static_cast<double>(pt2_x)) << endl;
+      double slope, angle_error;
+      slope = (static_cast<double>(pt1_y) - static_cast<double>(pt2_y)) / (static_cast<double>(pt1_x) - static_cast<double>(pt2_x));
+      // std::cout << "slope = " << slope << std::endl;
+      angle_error = slope - ANGLE_ERROR_TUNING;
 
       line(frame, Point(pt1_x, pt1_y) , Point(pt2_x , pt2_y) , Scalar(0,0,255) , 2 , 8);
 
       fitLine_msg.x = b.x;
       fitLine_msg.y = b.y;
       fitLine_msg.theta = m;
+
+      Point intersect_point;
+      double intersect_point_x, intersect_point_y;
+      intersect_point_x = ((pt1.x*pt2.y - pt1.y*pt2.x)*(pt1_x - pt2_x) - (pt1.x - pt2.x)*(pt1_x*pt2_y - pt1_y*pt2_x)) / ((pt1.x - pt2.x)*(pt1_y - pt2_y) - (pt1.y - pt2.y)*(pt1_x - pt2_x));
+      intersect_point_y = ((pt1.x*pt2.y - pt1.y*pt2.x)*(pt1_y - pt2_y) - (pt1.y - pt2.y)*(pt1_x*pt2_y - pt1_y*pt2_x)) / ((pt1.x - pt2.x)*(pt1_y - pt2_y) - (pt1.y - pt2.y)*(pt1_x - pt2_x));
+      intersect_point = Point(intersect_point_x, intersect_point_y);
+
+      Point ref_lateral_error;
+      double ref_lateral_error_x, ref_lateral_error_y, lateral_error;
+      ref_lateral_error_x = roi_width/2 - intersect_point.x;
+      ref_lateral_error_y = roi_width/2 - intersect_point.y;
+      ref_lateral_error = Point(ref_lateral_error_x, ref_lateral_error_y);
+      lateral_error = ref_lateral_error.x * LATERAL_ERROR_TUNING;
+
+      std::cout << "yellow lane angle error = " << angle_error << "\n" << "yellow lane lateral error = " << lateral_error << std::endl;
+      aviation_master::runway_alignment runway_align;
+      runway_align.angle_error = angle_error;
+      runway_align.lateral_error = lateral_error;
+      pub_runway_align.publish(runway_align);
     }
 
-
-   for(size_t i = 0; i < selected_lines.size(); i++)
+    for(size_t i = 0; i < selected_lines.size(); i++)
     {
       //cout << "i : " << i << endl;
       Vec4i I = selected_lines[i];
       line(frame, Point(I[0], I[1]), Point(I[2], I[3]) , Scalar(255,0,0) , 2 , 8);
     }
-
 
     //ROS_INFO("cols : %d , rows : %d" , frame.cols, frame.rows);
     sensor_msgs::ImagePtr pub_msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", frame).toImageMsg();
